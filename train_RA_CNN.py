@@ -7,11 +7,15 @@ import pickle
 import sys
 csv.field_size_limit(sys.maxsize)
 import os 
+os.environ["KERAS_BACKEND"] = "theano"
 import configparser
 import optparse 
 
+from tabulate import tabulate 
+
 import sklearn 
 from sklearn.metrics import accuracy_score
+from sklearn.cross_validation import StratifiedKFold 
 
 import pandas as pd 
 import numpy as np 
@@ -21,7 +25,6 @@ from gensim.models import Word2Vec
 
 from keras.callbacks import ModelCheckpoint
 
-
 import rationale_CNN
 from rationale_CNN import Document
 
@@ -29,6 +32,26 @@ from rationale_CNN import Document
 def load_trained_w2v_model(path="/work/03213/bwallace/maverick/RoB_CNNs/PubMed-w2v.bin"):
     m = Word2Vec.load_word2vec_format(path, binary=True)
     return m
+
+
+def _to_vec(sent_y, doc_label): 
+    '''
+    convert to binary output vectors, so that e.g., [1, 0, 0]
+    indicates a positive rationale; [0, 1, 0] a negative rationale
+    and [0, 0, 1] a non-rationale
+    '''
+    sent_lbl_vec = np.zeros(3)
+    if sent_y == 0:
+        sent_lbl_vec[-1] = 1.0
+    else: 
+        # then it's a rationale
+        if doc_label > 0: 
+            # positive rationale
+            sent_lbl_vec[0] = 1.0
+        else: 
+            # negative rationale
+            sent_lbl_vec[1] = 1.0
+    return sent_lbl_vec
 
 def read_data(path="/work/03213/bwallace/maverick/RoB-keras/RoB-data/train-Xy-w-sentences2-Random-sequence-generation.txt"):
     ''' 
@@ -51,27 +74,12 @@ def read_data(path="/work/03213/bwallace/maverick/RoB-keras/RoB-data/train-Xy-w-
 
         sentences = doc["sentence"].values
         sentence_labels = (doc["sentence_lbl"].values+1)/2
-        
-        # convert to binary output vectors, so that e.g., [1, 0, 0]
-        # indicates a positive rationale; [0, 1, 0] a negative rationale
-        # and [0, 0, 1] a non-rationale
-        def _to_vec(sent_y): 
-            sent_lbl_vec = np.zeros(3)
-            if sent_y == 0:
-                sent_lbl_vec[-1] = 1.0
-            else: 
-                # then it's a rationale
-                if doc_label > 0: 
-                    # positive rationale
-                    sent_lbl_vec[0] = 1.0
-                else: 
-                    # negative rationale
-                    sent_lbl_vec[1] = 1.0
-            return sent_lbl_vec
 
-        sentence_label_vectors = [_to_vec(sent_y) for sent_y in sentence_labels]
+        sentence_label_vectors = [_to_vec(sent_y, doc_label) for sent_y in sentence_labels]
         cur_doc = Document(doc_id, sentences, doc_label, sentence_label_vectors)
         documents.append(cur_doc)
+
+    
 
     return documents
 
@@ -136,8 +144,123 @@ def line_search_train(data_path, wvs_path, documents=None, test_mode=False,
         pickle.dump(perf_d, outf)
 
 
+def calc_metrics(y, y_cat):
 
-def train_CNN_rationales_model(data_path, wvs_path, documents=None, test_mode=False, 
+    precisions = sklearn.metrics.precision_score(y, y_cat, average=None) 
+    recalls    = sklearn.metrics.recall_score(y, y_cat, average=None) 
+
+    ## see: http://scikit-learn.org/stable/modules/generated/sklearn.metrics.f1_score.html
+    f1_micro = sklearn.metrics.fbeta_score(y, y_cat, beta=1, average="micro")
+    f1_macro = sklearn.metrics.fbeta_score(y, y_cat, beta=1, average="micro")
+
+    # naive baseline --- NOTE! 0 has been hard-coded as majority class
+    majority_baseline_acc = y.count(1)/float(len(y)) 
+
+    
+    # acc
+    accuracy = sklearn.metrics.accuracy_score(y, y_cat)
+    print ("accuracy: {0}; v. baseline of: {1}".format(accuracy, majority_baseline_acc))
+    return pd.DataFrame({"accuracy":[accuracy], "majority_baseline":[majority_baseline_acc], 
+                            "f1-micro":[f1_micro], "f1-macro":[f1_macro], 
+                            "recall":[recalls[1]], "precision":[precisions[1]]})
+
+
+
+def cv_CNN_rationales(data_path, wvs_path, n_folds=10, test_mode=False, 
+                                model_name="rationale-CNN", 
+                                nb_epoch_sentences=20, nb_epoch_doc=25, val_split=.1,
+                                sentence_dropout=0.5, document_dropout=0.5, run_name="RSG",
+                                shuffle_data=True, max_features=20000, 
+                                max_sent_len=25, max_doc_len=200,
+                                n_filters=32,
+                                batch_size=50,
+                                end_to_end_train=False,
+                                downsample=False,
+                                stopword=True,
+                                pos_class_weight=1):
+
+    documents = read_data(path=data_path)
+    if shuffle_data:
+        print ("shuffling!!!")
+        random.shuffle(documents)
+
+    wvs = load_trained_w2v_model(path=wvs_path)
+    
+    doc_labels = [doc.doc_y for doc in documents]
+    skf = StratifiedKFold(doc_labels, n_folds=n_folds, shuffle=True, random_state=1337)
+
+    results_df = None # this will store all results (across folds)
+    for fold, (train, test) in enumerate(skf):
+        print("on fold {}".format(fold))
+
+        train_docs_for_fold = [documents[idx] for idx in train]
+        train_y = [doc.doc_y for doc in train_docs_for_fold]
+        if not downsample and pos_class_weight=="auto":
+            pos_class_frac = train_y.count(1)/float(len(train_y))
+            pos_class_weight = 1.0/pos_class_frac
+            print("setting positive class weight to: {}".format(pos_class_weight)) 
+
+        else:
+            pos_class_weight = 1
+
+        test_docs_for_fold  = [documents[idx] for idx in test]
+        r_CNN, documents_tmp, p = train_CNN_rationales_model(data_path, wvs_path,
+                                wvs=wvs,
+                                documents=train_docs_for_fold, 
+                                test_mode=test_mode, 
+                                model_name=model_name, 
+                                nb_epoch_sentences=nb_epoch_sentences, 
+                                nb_epoch_doc=nb_epoch_doc, 
+                                val_split=val_split,
+                                sentence_dropout=sentence_dropout,
+                                document_dropout=document_dropout, 
+                                run_name=run_name + "_{}".format(fold),
+                                shuffle_data=shuffle_data,
+                                max_features=max_features, 
+                                max_sent_len=max_sent_len, 
+                                max_doc_len=max_doc_len,
+                                end_to_end_train=end_to_end_train,
+                                pos_class_weight=pos_class_weight,
+                                downsample=downsample)
+
+
+        test_rationales, test_predictions = [], []
+        y, y_hat = [], []
+        preds = [["true label", "raw prediction", "predicted label", "correct?", "rationale (1)", "rationale (2)"]]
+        for test_doc in test_docs_for_fold:
+            pred, rationales = r_CNN.predict_and_rank_sentences_for_doc(test_doc, num_rationales=2)
+            cat_pred = int(round(pred))
+            y_hat.append(cat_pred)
+            y.append(test_doc.doc_y)
+
+            if cat_pred == test_doc.doc_y:
+                #print("CORRECT! label {0}; rationales (2): {1}".format(test_doc.doc_y, ", ".join(rationales)))
+                preds.append(["{}".format(test_doc.doc_y), "{0:.3f}".format(pred), "{}".format(cat_pred), "Y", rationales[0], rationales[1]])
+            else:
+                #print("MISTAKE! label {0}; rationales (2): {1}".format(test_doc.doc_y, ", ".join(rationales)))
+                preds.append(["{}".format(test_doc.doc_y), "{0:.3f}".format(pred), "{}".format(cat_pred), "N", rationales[0], rationales[1]])
+            
+
+        with open("predictions-{}.csv".format(fold), 'wb') as outf: 
+            writer = csv.writer(outf)
+            writer.writerows(preds)
+       
+        metrics_df = calc_metrics(y, y_hat)
+
+        metrics_df["fold"] = [fold]
+        print(metrics_df)
+        if results_df is None: 
+            results_df = metrics_df
+        else: 
+            results_df = pd.concat([results_df, metrics_df])
+        
+
+    print(tabulate(results_df, headers='keys', tablefmt='psql'))
+    results_df.to_csv("results.csv")
+    return results_df
+
+def train_CNN_rationales_model(data_path, wvs_path, wvs=None,
+                                documents=None, test_mode=False, 
                                 model_name="rationale-CNN", 
                                 nb_epoch_sentences=20, nb_epoch_doc=25, val_split=.1,
                                 sentence_dropout=0.5, document_dropout=0.5, run_name="RSG",
@@ -155,7 +278,8 @@ def train_CNN_rationales_model(data_path, wvs_path, documents=None, test_mode=Fa
         if shuffle_data: 
             random.shuffle(documents)
 
-    wvs = load_trained_w2v_model(path=wvs_path)
+    if wvs is None:
+        wvs = load_trained_w2v_model(path=wvs_path)
 
     all_sentences = []
     for d in documents: 
@@ -171,7 +295,8 @@ def train_CNN_rationales_model(data_path, wvs_path, documents=None, test_mode=Fa
     for d in documents: 
         d.generate_sequences(p)
 
-    r_CNN = rationale_CNN.RationaleCNN(p, filters=[3,4,5], 
+    
+    r_CNN = rationale_CNN.RationaleCNN(p, filters=[1,2,3], 
                                         n_filters=n_filters, 
                                         sent_dropout=sentence_dropout, 
                                         doc_dropout=document_dropout,
@@ -186,6 +311,7 @@ def train_CNN_rationales_model(data_path, wvs_path, documents=None, test_mode=Fa
     else: 
         r_CNN.build_RA_CNN_model()
 
+
     ###################################
     # 2. pre-train sentence model, if # 
     #     appropriate.                #
@@ -196,9 +322,8 @@ def train_CNN_rationales_model(data_path, wvs_path, documents=None, test_mode=Fa
             r_CNN.train_sentence_model(documents, nb_epoch=nb_epoch_sentences, 
                                         sent_val_split=val_split, downsample=True)
             print("done.")
-
-
-
+            
+    
     # write out model architecture
     json_string = r_CNN.doc_model.to_json() 
     with open("%s_model.json" % model_name, 'w') as outf:
@@ -310,6 +435,14 @@ if __name__ == "__main__":
         help="line search over sentence dropout parameter?", 
         action='store_true', default=False)
 
+    parser.add_option('--cv', '--cross-validate', dest="cross_validation",
+        help="cross validate?", 
+        action='store_true', default=False)
+
+    parser.add_option('--nfolds', '--num-folds', dest="num_folds",
+        help="number of folds (for CV)", 
+        default=10, type="int")
+
     parser.add_option('--ds', '--downsample', dest="downsample",
         help="create balanced mini-batches during training?", 
         action='store_true', default=False)
@@ -328,7 +461,44 @@ if __name__ == "__main__":
 
     print("running model: %s" % options.model)
 
-    if not options.line_search_sent_dropout:
+    if options.line_search_sent_dropout:
+        print("--- line searching! ---")
+        line_search_train(data_path, wv_path, model_name=options.model, 
+                                    nb_epoch_sentences=options.sentence_nb_epochs,
+                                    nb_epoch_doc=options.document_nb_epochs,
+                                    document_dropout=options.dropout_document,
+                                    run_name=options.run_name,
+                                    test_mode=options.test_mode,
+                                    val_split=options.val_split,
+                                    shuffle_data=options.shuffle_data,
+                                    n_filters=options.n_filters,
+                                    max_sent_len=options.max_sent_len,
+                                    max_doc_len=options.max_doc_len,
+                                    max_features=options.max_features,
+                                    end_to_end_train=options.end_to_end_train,
+                                    downsample=options.downsample,
+                                    stopword=options.stopword,
+                                    pos_class_weight=options.pos_class_weight)
+    elif options.cross_validation:
+        print("--- running cross-fold validation! ---")
+        results_df = cv_CNN_rationales(data_path, wv_path, model_name=options.model, 
+                                    nb_epoch_sentences=options.sentence_nb_epochs,
+                                    nb_epoch_doc=options.document_nb_epochs,
+                                    document_dropout=options.dropout_document,
+                                    run_name=options.run_name,
+                                    test_mode=options.test_mode,
+                                    n_folds=options.num_folds,
+                                    val_split=options.val_split,
+                                    shuffle_data=options.shuffle_data,
+                                    n_filters=options.n_filters,
+                                    max_sent_len=options.max_sent_len,
+                                    max_doc_len=options.max_doc_len,
+                                    max_features=options.max_features,
+                                    end_to_end_train=options.end_to_end_train,
+                                    downsample=options.downsample,
+                                    stopword=options.stopword,
+                                    pos_class_weight=options.pos_class_weight)
+    else:
         r_CNN, documents, p = train_CNN_rationales_model(
                                     data_path, wv_path, 
                                     model_name=options.model, 
@@ -360,25 +530,6 @@ if __name__ == "__main__":
         # sanity check!
         #doc0 = documents[0]
         #pred, rationales =r_CNN.predict_and_rank_sentences_for_doc(doc0, num_rationales=2)
-        
-        #import pdb; pdb.set_trace()
+   
 
 
-    else:
-        print("line searching!")
-        line_search_train(data_path, wv_path, model_name=options.model, 
-                                    nb_epoch_sentences=options.sentence_nb_epochs,
-                                    nb_epoch_doc=options.document_nb_epochs,
-                                    document_dropout=options.dropout_document,
-                                    run_name=options.run_name,
-                                    test_mode=options.test_mode,
-                                    val_split=options.val_split,
-                                    shuffle_data=options.shuffle_data,
-                                    n_filters=options.n_filters,
-                                    max_sent_len=options.max_sent_len,
-                                    max_doc_len=options.max_doc_len,
-                                    max_features=options.max_features,
-                                    end_to_end_train=options.end_to_end_train,
-                                    downsample=options.downsample,
-                                    stopword=options.stopword,
-                                    pos_class_weight=options.pos_class_weight)
